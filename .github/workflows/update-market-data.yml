@@ -22,25 +22,90 @@ jobs:
           import csv
           import datetime
           import json
+          import time
           import urllib.parse
           import urllib.request
 
           HISTORY_FILE = "history.json"
           DATA_FILE = "data.json"
 
-          symbols = {
-              "sp500": "^GSPC",
-              "nasdaq100": "^NDX"
-          }
-
           # ---------------------------------------
-          # history.jsonを読み込む
+          # 通信関数
           # ---------------------------------------
 
-          with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+          def fetch_json(url, retries=3, timeout=60):
+              last_error = None
+
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          headers={
+                              "User-Agent": "Mozilla/5.0"
+                          }
+                      )
+
+                      with urllib.request.urlopen(
+                          req,
+                          timeout=timeout
+                      ) as r:
+                          return json.load(r)
+
+                  except Exception as e:
+                      last_error = e
+                      print(
+                          f"Request failed "
+                          f"(attempt {attempt + 1}/{retries}): {e}"
+                      )
+
+                      if attempt < retries - 1:
+                          time.sleep(5)
+
+              raise last_error
+
+
+          def fetch_text(url, retries=3, timeout=60):
+              last_error = None
+
+              for attempt in range(retries):
+                  try:
+                      req = urllib.request.Request(
+                          url,
+                          headers={
+                              "User-Agent": "Mozilla/5.0"
+                          }
+                      )
+
+                      with urllib.request.urlopen(
+                          req,
+                          timeout=timeout
+                      ) as r:
+                          return r.read().decode("utf-8")
+
+                  except Exception as e:
+                      last_error = e
+                      print(
+                          f"Request failed "
+                          f"(attempt {attempt + 1}/{retries}): {e}"
+                      )
+
+                      if attempt < retries - 1:
+                          time.sleep(5)
+
+              raise last_error
+
+
+          # ---------------------------------------
+          # history.json読み込み
+          # ---------------------------------------
+
+          with open(
+              HISTORY_FILE,
+              "r",
+              encoding="utf-8"
+          ) as f:
               history = json.load(f)
 
-          # 実際のhistory.jsonでは「markets」に履歴が入っている
           old_rows = history.get("markets", [])
 
           if not old_rows:
@@ -55,37 +120,56 @@ jobs:
 
           last_date = max(rows_by_date.keys())
 
-          print(f"Existing last date: {last_date}")
+          print(
+              f"Existing last date: {last_date}"
+          )
+
 
           # ---------------------------------------
           # Yahoo Finance
           # ---------------------------------------
 
+          symbols = {
+              "sp500": "^GSPC",
+              "nasdaq100": "^NDX"
+          }
+
           market_data = {}
 
           for name, symbol in symbols.items():
+
+              print(
+                  f"Fetching Yahoo Finance: {symbol}"
+              )
 
               url = (
                   "https://query1.finance.yahoo.com/v8/finance/chart/"
                   + urllib.parse.quote(symbol)
                   + "?range=30d&interval=1d"
-                  + "&events=history&includePrePost=false"
+                  + "&events=history"
+                  + "&includePrePost=false"
               )
 
-              req = urllib.request.Request(
-                  url,
-                  headers={"User-Agent": "Mozilla/5.0"}
-              )
+              result = fetch_json(url)
 
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  result = json.load(r)["chart"]["result"][0]
+              chart_result = result["chart"]["result"]
+
+              if not chart_result:
+                  raise RuntimeError(
+                      f"{symbol}: Yahoo Financeからデータを取得できません"
+                  )
+
+              result = chart_result[0]
 
               timestamps = result["timestamp"]
               closes = result["indicators"]["quote"][0]["close"]
 
               values = {}
 
-              for ts, close in zip(timestamps, closes):
+              for ts, close in zip(
+                  timestamps,
+                  closes
+              ):
 
                   if close is None:
                       continue
@@ -99,25 +183,50 @@ jobs:
 
               market_data[name] = values
 
+              print(
+                  f"{symbol}: {len(values)} rows"
+              )
+
+
           # ---------------------------------------
           # FRED DFF
+          #
+          # 全期間ではなく直近60日だけ取得
           # ---------------------------------------
 
+          last_date_obj = datetime.date.fromisoformat(
+              last_date
+          )
+
+          fred_start = (
+              last_date_obj
+              - datetime.timedelta(days=60)
+          ).isoformat()
+
+          fred_end = (
+              datetime.date.today()
+              + datetime.timedelta(days=1)
+          ).isoformat()
+
+          print(
+              f"Fetching FRED DFF: "
+              f"{fred_start} -> {fred_end}"
+          )
+
           dff_url = (
-              "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
+              "https://fred.stlouisfed.org/graph/fredgraph.csv"
+              "?id=DFF"
+              f"&cosd={fred_start}"
+              f"&coed={fred_end}"
           )
 
-          req = urllib.request.Request(
-              dff_url,
-              headers={"User-Agent": "Mozilla/5.0"}
-          )
-
-          with urllib.request.urlopen(req, timeout=30) as r:
-              text = r.read().decode("utf-8")
+          text = fetch_text(dff_url)
 
           dff_values = {}
 
-          reader = csv.DictReader(text.splitlines())
+          reader = csv.DictReader(
+              text.splitlines()
+          )
 
           for row in reader:
 
@@ -127,13 +236,19 @@ jobs:
               if value and value != ".":
                   dff_values[date] = float(value)
 
+          print(
+              f"DFF: {len(dff_values)} rows"
+          )
+
+
           # ---------------------------------------
           # 新しい市場データを追加
           # ---------------------------------------
 
           all_dates = sorted(
               set(market_data["sp500"].keys())
-              & set(market_data["nasdaq100"].keys())
+              &
+              set(market_data["nasdaq100"].keys())
           )
 
           added = 0
@@ -143,38 +258,52 @@ jobs:
               if date <= last_date:
                   continue
 
-              # その日にDFFがなければ、
-              # 直近の利用可能なDFFを使用
-              available_dff_dates = [
-                  d for d in dff_values.keys()
+              # その日のDFFがなければ、
+              # 直近のDFFを使用
+              available_dates = [
+                  d
+                  for d in dff_values.keys()
                   if d <= date
               ]
 
-              if not available_dff_dates:
+              if not available_dates:
+                  print(
+                      f"Skipping {date}: "
+                      "DFF not available"
+                  )
                   continue
 
-              latest_dff_date = max(available_dff_dates)
-              dff = dff_values[latest_dff_date]
+              dff_date = max(
+                  available_dates
+              )
+
+              dff = dff_values[dff_date]
 
               rows_by_date[date] = {
                   "date": date,
                   "sp500_close": round(
-                      market_data["sp500"][date], 6
+                      market_data["sp500"][date],
+                      6
                   ),
                   "nasdaq100_close": round(
-                      market_data["nasdaq100"][date], 6
+                      market_data["nasdaq100"][date],
+                      6
                   ),
-                  "dff": round(dff, 6)
+                  "dff": round(
+                      dff,
+                      6
+                  )
               }
 
               print(
                   f"Added: {date} "
-                  f"S&P500={market_data['sp500'][date]} "
-                  f"NDX={market_data['nasdaq100'][date]} "
-                  f"DFF={dff}"
+                  f"S&P500={market_data['sp500'][date]:.2f} "
+                  f"NDX={market_data['nasdaq100'][date]:.2f} "
+                  f"DFF={dff:.2f}"
               )
 
               added += 1
+
 
           # ---------------------------------------
           # 日付順に並べる
@@ -182,8 +311,11 @@ jobs:
 
           all_rows = [
               rows_by_date[d]
-              for d in sorted(rows_by_date.keys())
+              for d in sorted(
+                  rows_by_date.keys()
+              )
           ]
+
 
           # ---------------------------------------
           # history.json更新
@@ -191,11 +323,17 @@ jobs:
 
           history["markets"] = all_rows
           history["end_date"] = all_rows[-1]["date"]
-          history["updated_at_utc"] = datetime.datetime.now(
-              datetime.timezone.utc
-          ).isoformat()
+          history["updated_at_utc"] = (
+              datetime.datetime.now(
+                  datetime.timezone.utc
+              ).isoformat()
+          )
 
-          with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+          with open(
+              HISTORY_FILE,
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
                   history,
                   f,
@@ -206,12 +344,14 @@ jobs:
           print(
               f"History rows: {len(all_rows)}"
           )
+
           print(
               f"New rows added: {added}"
           )
 
+
           # ---------------------------------------
-          # 最新200営業日の200DMA
+          # 200DMA計算
           # ---------------------------------------
 
           latest = all_rows[-1]
@@ -226,61 +366,90 @@ jobs:
               for row in all_rows
           ]
 
-          if len(sp_values) < 200 or len(ndx_values) < 200:
+          if (
+              len(sp_values) < 200
+              or len(ndx_values) < 200
+          ):
               raise RuntimeError(
                   "200営業日分のデータがありません"
               )
 
-          sp_ma200 = sum(sp_values[-200:]) / 200
-          ndx_ma200 = sum(ndx_values[-200:]) / 200
+          sp_ma200 = (
+              sum(sp_values[-200:])
+              / 200
+          )
+
+          ndx_ma200 = (
+              sum(ndx_values[-200:])
+              / 200
+          )
 
           sp_deviation = (
-              latest["sp500_close"] / sp_ma200 - 1
+              latest["sp500_close"]
+              / sp_ma200
+              - 1
           ) * 100
 
           ndx_deviation = (
-              latest["nasdaq100_close"] / ndx_ma200 - 1
+              latest["nasdaq100_close"]
+              / ndx_ma200
+              - 1
           ) * 100
+
 
           # ---------------------------------------
           # data.json更新
           # ---------------------------------------
 
           data = {
-              "updated_at_utc": datetime.datetime.now(
-                  datetime.timezone.utc
-              ).isoformat(),
+              "updated_at_utc":
+                  datetime.datetime.now(
+                      datetime.timezone.utc
+                  ).isoformat(),
+
               "markets": {
+
                   "sp500": {
                       "symbol": "^GSPC",
                       "date": latest["date"],
                       "close": round(
-                          latest["sp500_close"], 6
+                          latest["sp500_close"],
+                          6
                       ),
                       "ma200": round(
-                          sp_ma200, 6
+                          sp_ma200,
+                          6
                       ),
                       "deviation_pct": round(
-                          sp_deviation, 6
+                          sp_deviation,
+                          6
                       )
                   },
+
                   "nasdaq100": {
                       "symbol": "^NDX",
                       "date": latest["date"],
                       "close": round(
-                          latest["nasdaq100_close"], 6
+                          latest["nasdaq100_close"],
+                          6
                       ),
                       "ma200": round(
-                          ndx_ma200, 6
+                          ndx_ma200,
+                          6
                       ),
                       "deviation_pct": round(
-                          ndx_deviation, 6
+                          ndx_deviation,
+                          6
                       )
                   }
               }
           }
 
-          with open(DATA_FILE, "w", encoding="utf-8") as f:
+          with open(
+              DATA_FILE,
+              "w",
+              encoding="utf-8"
+          ) as f:
               json.dump(
                   data,
                   f,
@@ -288,9 +457,12 @@ jobs:
                   indent=2
               )
 
-          print("data.json updated")
+          print(
+              "data.json updated"
+          )
 
           PY
+
 
       - name: Commit updated data
         run: |
