@@ -16,32 +16,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fetch Yahoo Finance daily closes
+      - name: Update history and market data
         run: |
           python - <<'PY'
-          import json
-          import urllib.request
-          import urllib.parse
+          import csv
           import datetime
+          import json
+          import urllib.parse
+          import urllib.request
+
+          HISTORY_FILE = "history.json"
+          DATA_FILE = "data.json"
 
           symbols = {
               "sp500": "^GSPC",
               "nasdaq100": "^NDX"
           }
 
-          out = {
-              "updated_at_utc": datetime.datetime.now(
-                  datetime.timezone.utc
-              ).isoformat(),
-              "markets": {}
+          # ---------------------------------------
+          # history.jsonを読み込む
+          # ---------------------------------------
+
+          with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+              history = json.load(f)
+
+          old_rows = history.get("data", history.get("rows", []))
+
+          if not old_rows:
+              raise RuntimeError("history.jsonに履歴データがありません")
+
+          # dateをキーにして既存データを管理
+          rows_by_date = {
+              row["date"]: row
+              for row in old_rows
           }
+
+          last_date = max(rows_by_date.keys())
+
+          print(f"Existing last date: {last_date}")
+
+          # ---------------------------------------
+          # Yahoo Financeから直近データ取得
+          # 少し余裕を持って30日分取得
+          # ---------------------------------------
+
+          market_data = {}
 
           for name, symbol in symbols.items():
 
               url = (
                   "https://query1.finance.yahoo.com/v8/finance/chart/"
                   + urllib.parse.quote(symbol)
-                  + "?range=2y&interval=1d"
+                  + "?range=30d&interval=1d"
                   + "&events=history&includePrePost=false"
               )
 
@@ -56,47 +82,204 @@ jobs:
               timestamps = result["timestamp"]
               closes = result["indicators"]["quote"][0]["close"]
 
-              rows = []
+              values = {}
 
               for ts, close in zip(timestamps, closes):
-                  if close is not None:
-                      date = datetime.datetime.fromtimestamp(
-                          ts,
-                          datetime.timezone.utc
-                      ).date().isoformat()
+                  if close is None:
+                      continue
 
-                      rows.append((date, close))
+                  date = datetime.datetime.fromtimestamp(
+                      ts,
+                      datetime.timezone.utc
+                  ).date().isoformat()
 
-              if len(rows) < 200:
-                  raise RuntimeError(
-                      f"{symbol}: 200営業日分のデータがありません"
-                  )
+                  values[date] = float(close)
 
-              # 直近確定終値
-              date, close = rows[-1]
+              market_data[name] = values
 
-              # 直近200営業日の終値から200DMAを計算
-              last200 = [x[1] for x in rows[-200:]]
-              ma200 = sum(last200) / 200
+          # ---------------------------------------
+          # FRED DFF取得
+          # ---------------------------------------
 
-              # 200DMAからの乖離率
-              deviation = (close / ma200 - 1) * 100
+          dff_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
 
-              out["markets"][name] = {
-                  "symbol": symbol,
+          req = urllib.request.Request(
+              dff_url,
+              headers={"User-Agent": "Mozilla/5.0"}
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as r:
+              text = r.read().decode("utf-8")
+
+          dff_values = {}
+
+          reader = csv.DictReader(text.splitlines())
+
+          for row in reader:
+              date = row["observation_date"]
+              value = row["DFF"]
+
+              if value and value != ".":
+                  dff_values[date] = float(value)
+
+          # ---------------------------------------
+          # 新しい市場データを追加
+          # ---------------------------------------
+
+          all_dates = sorted(
+              set(market_data["sp500"].keys())
+              & set(market_data["nasdaq100"].keys())
+          )
+
+          for date in all_dates:
+
+              if date <= last_date:
+                  continue
+
+              # その日のDFFがなければ、
+              # 直近で利用可能なDFFを使用
+              available_dff_dates = [
+                  d for d in dff_values.keys()
+                  if d <= date
+              ]
+
+              if not available_dff_dates:
+                  continue
+
+              latest_dff_date = max(available_dff_dates)
+              dff = dff_values[latest_dff_date]
+
+              rows_by_date[date] = {
                   "date": date,
-                  "close": round(close, 6),
-                  "ma200": round(ma200, 6),
-                  "deviation_pct": round(deviation, 6)
+                  "sp500_close": round(
+                      market_data["sp500"][date], 6
+                  ),
+                  "nasdaq100_close": round(
+                      market_data["nasdaq100"][date], 6
+                  ),
+                  "dff": round(dff, 6)
               }
 
-          with open("data.json", "w", encoding="utf-8") as f:
+              print(
+                  f"Added: {date} "
+                  f"S&P500={market_data['sp500'][date]} "
+                  f"NDX={market_data['nasdaq100'][date]} "
+                  f"DFF={dff}"
+              )
+
+          # ---------------------------------------
+          # 日付順に並べ直す
+          # ---------------------------------------
+
+          all_rows = [
+              rows_by_date[d]
+              for d in sorted(rows_by_date.keys())
+          ]
+
+          # ---------------------------------------
+          # history.json保存
+          # ---------------------------------------
+
+          history["data"] = all_rows
+          history["end_date"] = all_rows[-1]["date"]
+          history["updated_at_utc"] = datetime.datetime.now(
+              datetime.timezone.utc
+          ).isoformat()
+
+          with open(HISTORY_FILE, "w", encoding="utf-8") as f:
               json.dump(
-                  out,
+                  history,
                   f,
                   ensure_ascii=False,
                   indent=2
               )
+
+          print(
+              f"History now contains {len(all_rows)} rows"
+          )
+
+          # ---------------------------------------
+          # 最新200営業日から200DMAを計算
+          # ---------------------------------------
+
+          latest = all_rows[-1]
+
+          sp_values = [
+              row["sp500_close"]
+              for row in all_rows
+              if row.get("sp500_close") is not None
+          ]
+
+          ndx_values = [
+              row["nasdaq100_close"]
+              for row in all_rows
+              if row.get("nasdaq100_close") is not None
+          ]
+
+          if len(sp_values) < 200 or len(ndx_values) < 200:
+              raise RuntimeError(
+                  "200営業日分のデータがありません"
+              )
+
+          sp_ma200 = sum(sp_values[-200:]) / 200
+          ndx_ma200 = sum(ndx_values[-200:]) / 200
+
+          sp_deviation = (
+              latest["sp500_close"] / sp_ma200 - 1
+          ) * 100
+
+          ndx_deviation = (
+              latest["nasdaq100_close"] / ndx_ma200 - 1
+          ) * 100
+
+          # ---------------------------------------
+          # data.json保存
+          # ---------------------------------------
+
+          data = {
+              "updated_at_utc": datetime.datetime.now(
+                  datetime.timezone.utc
+              ).isoformat(),
+              "markets": {
+                  "sp500": {
+                      "symbol": "^GSPC",
+                      "date": latest["date"],
+                      "close": round(
+                          latest["sp500_close"], 6
+                      ),
+                      "ma200": round(
+                          sp_ma200, 6
+                      ),
+                      "deviation_pct": round(
+                          sp_deviation, 6
+                      )
+                  },
+                  "nasdaq100": {
+                      "symbol": "^NDX",
+                      "date": latest["date"],
+                      "close": round(
+                          latest["nasdaq100_close"], 6
+                      ),
+                      "ma200": round(
+                          ndx_ma200, 6
+                      ),
+                      "deviation_pct": round(
+                          ndx_deviation, 6
+                      )
+                  }
+              }
+          }
+
+          with open(DATA_FILE, "w", encoding="utf-8") as f:
+              json.dump(
+                  data,
+                  f,
+                  ensure_ascii=False,
+                  indent=2
+              )
+
+          print("data.json updated")
+
           PY
 
       - name: Commit updated data
@@ -104,11 +287,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add data.json
+          git add history.json data.json
 
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Update market data"
+            git commit -m "Update market history"
             git push
           fi
