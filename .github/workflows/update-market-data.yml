@@ -16,6 +16,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ---------------------------------------
+      # FRED接続診断
+      # ---------------------------------------
+      - name: Test FRED connection
+        run: |
+          echo "=== DNS ==="
+          getent hosts fred.stlouisfed.org || true
+
+          echo "=== HTTPS HEAD ==="
+          curl -4 -I -L --max-time 30 \
+            "https://fred.stlouisfed.org/"
+
+          echo "=== FRED CSV ==="
+          curl -4 -v -L --max-time 30 \
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF&cosd=2026-07-03&coed=2026-09-03" \
+            -o /tmp/dff.csv
+
+          echo "=== CSV RESULT ==="
+          head -5 /tmp/dff.csv
+
       - name: Update history and market data
         run: |
           python - <<'PY'
@@ -63,7 +83,6 @@ jobs:
 
               raise last_error
 
-
           def fetch_text(url, retries=3, timeout=60):
               last_error = None
 
@@ -94,7 +113,6 @@ jobs:
 
               raise last_error
 
-
           # ---------------------------------------
           # history.json読み込み
           # ---------------------------------------
@@ -123,7 +141,6 @@ jobs:
           print(
               f"Existing last date: {last_date}"
           )
-
 
           # ---------------------------------------
           # Yahoo Finance
@@ -187,11 +204,8 @@ jobs:
                   f"{symbol}: {len(values)} rows"
               )
 
-
           # ---------------------------------------
           # FRED DFF
-          #
-          # 全期間ではなく直近60日だけ取得
           # ---------------------------------------
 
           last_date_obj = datetime.date.fromisoformat(
@@ -239,7 +253,6 @@ jobs:
           print(
               f"DFF: {len(dff_values)} rows"
           )
-
 
           # ---------------------------------------
           # 新しい市場データを追加
@@ -304,7 +317,6 @@ jobs:
 
               added += 1
 
-
           # ---------------------------------------
           # 日付順に並べる
           # ---------------------------------------
@@ -316,13 +328,14 @@ jobs:
               )
           ]
 
-
           # ---------------------------------------
           # history.json更新
           # ---------------------------------------
 
           history["markets"] = all_rows
+
           history["end_date"] = all_rows[-1]["date"]
+
           history["updated_at_utc"] = (
               datetime.datetime.now(
                   datetime.timezone.utc
@@ -334,6 +347,7 @@ jobs:
               "w",
               encoding="utf-8"
           ) as f:
+
               json.dump(
                   history,
                   f,
@@ -348,7 +362,6 @@ jobs:
           print(
               f"New rows added: {added}"
           )
-
 
           # ---------------------------------------
           # 200DMA計算
@@ -395,7 +408,6 @@ jobs:
               / ndx_ma200
               - 1
           ) * 100
-
 
           # ---------------------------------------
           # data.json更新
@@ -450,6 +462,7 @@ jobs:
               "w",
               encoding="utf-8"
           ) as f:
+
               json.dump(
                   data,
                   f,
@@ -462,7 +475,6 @@ jobs:
           )
 
           PY
-
 
       - name: Commit updated data
         run: |
