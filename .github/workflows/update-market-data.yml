@@ -40,12 +40,14 @@ jobs:
           with open(HISTORY_FILE, "r", encoding="utf-8") as f:
               history = json.load(f)
 
-          old_rows = history.get("data", history.get("rows", []))
+          # 実際のhistory.jsonでは「markets」に履歴が入っている
+          old_rows = history.get("markets", [])
 
           if not old_rows:
-              raise RuntimeError("history.jsonに履歴データがありません")
+              raise RuntimeError(
+                  "history.jsonに履歴データがありません"
+              )
 
-          # dateをキーにして既存データを管理
           rows_by_date = {
               row["date"]: row
               for row in old_rows
@@ -56,8 +58,7 @@ jobs:
           print(f"Existing last date: {last_date}")
 
           # ---------------------------------------
-          # Yahoo Financeから直近データ取得
-          # 少し余裕を持って30日分取得
+          # Yahoo Finance
           # ---------------------------------------
 
           market_data = {}
@@ -85,6 +86,7 @@ jobs:
               values = {}
 
               for ts, close in zip(timestamps, closes):
+
                   if close is None:
                       continue
 
@@ -98,10 +100,12 @@ jobs:
               market_data[name] = values
 
           # ---------------------------------------
-          # FRED DFF取得
+          # FRED DFF
           # ---------------------------------------
 
-          dff_url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
+          dff_url = (
+              "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
+          )
 
           req = urllib.request.Request(
               dff_url,
@@ -116,6 +120,7 @@ jobs:
           reader = csv.DictReader(text.splitlines())
 
           for row in reader:
+
               date = row["observation_date"]
               value = row["DFF"]
 
@@ -131,13 +136,15 @@ jobs:
               & set(market_data["nasdaq100"].keys())
           )
 
+          added = 0
+
           for date in all_dates:
 
               if date <= last_date:
                   continue
 
-              # その日のDFFがなければ、
-              # 直近で利用可能なDFFを使用
+              # その日にDFFがなければ、
+              # 直近の利用可能なDFFを使用
               available_dff_dates = [
                   d for d in dff_values.keys()
                   if d <= date
@@ -167,8 +174,10 @@ jobs:
                   f"DFF={dff}"
               )
 
+              added += 1
+
           # ---------------------------------------
-          # 日付順に並べ直す
+          # 日付順に並べる
           # ---------------------------------------
 
           all_rows = [
@@ -177,10 +186,10 @@ jobs:
           ]
 
           # ---------------------------------------
-          # history.json保存
+          # history.json更新
           # ---------------------------------------
 
-          history["data"] = all_rows
+          history["markets"] = all_rows
           history["end_date"] = all_rows[-1]["date"]
           history["updated_at_utc"] = datetime.datetime.now(
               datetime.timezone.utc
@@ -195,11 +204,14 @@ jobs:
               )
 
           print(
-              f"History now contains {len(all_rows)} rows"
+              f"History rows: {len(all_rows)}"
+          )
+          print(
+              f"New rows added: {added}"
           )
 
           # ---------------------------------------
-          # 最新200営業日から200DMAを計算
+          # 最新200営業日の200DMA
           # ---------------------------------------
 
           latest = all_rows[-1]
@@ -207,13 +219,11 @@ jobs:
           sp_values = [
               row["sp500_close"]
               for row in all_rows
-              if row.get("sp500_close") is not None
           ]
 
           ndx_values = [
               row["nasdaq100_close"]
               for row in all_rows
-              if row.get("nasdaq100_close") is not None
           ]
 
           if len(sp_values) < 200 or len(ndx_values) < 200:
@@ -233,7 +243,7 @@ jobs:
           ) * 100
 
           # ---------------------------------------
-          # data.json保存
+          # data.json更新
           # ---------------------------------------
 
           data = {
