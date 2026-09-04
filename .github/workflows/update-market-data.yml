@@ -2,10 +2,8 @@ name: Update market data
 
 on:
   schedule:
-    # GitHub Actions cron is UTC. Both entries, together with the time gate
-    # below, run exactly once at 16:05 America/New_York across DST changes.
-    - cron: "5 20 * * 1-5"
-    - cron: "5 21 * * 1-5"
+    - cron: "5 16 * * 1-5"
+      timezone: "America/New_York"
   workflow_dispatch:
 
 permissions:
@@ -24,8 +22,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Update market history and DFF
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import csv
@@ -151,17 +147,6 @@ jobs:
                   print(f"Waiting {seconds:.0f}s for the H.15 release window")
                   time.sleep(seconds)
 
-
-          def scheduled_at_target_time():
-              current = now_utc().astimezone(NY)
-              return current.weekday() < 5 and current.hour == 16 and current.minute == 5
-
-
-          # A duplicate UTC schedule is necessary for DST. Skip the non-matching
-          # one, while allowing workflow_dispatch to run a single immediate check.
-          if os.environ.get("EVENT_NAME") == "schedule" and not scheduled_at_target_time():
-              print("Skipping UTC schedule entry outside 16:05 America/New_York")
-              raise SystemExit(0)
 
           with HISTORY_FILE.open(encoding="utf-8") as handle:
               history = json.load(handle)
