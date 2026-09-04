@@ -2,11 +2,18 @@ name: Update market data
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    # GitHub Actions cron is UTC. Both entries, together with the time gate
+    # below, run exactly once at 16:05 America/New_York across DST changes.
+    - cron: "5 20 * * 1-5"
+    - cron: "5 21 * * 1-5"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: update-market-data
+  cancel-in-progress: false
 
 jobs:
   update:
@@ -16,453 +23,278 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Update history and market data
+      - name: Update market history and DFF
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           python - <<'PY'
           import csv
-          import datetime
+          import datetime as dt
           import json
-          import subprocess
+          import os
           import tempfile
+          import time
           import urllib.parse
           import urllib.request
+          from bisect import bisect_right
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
 
-          HISTORY_FILE = "history.json"
-          DATA_FILE = "data.json"
+          HISTORY_FILE = Path("history.json")
+          DATA_FILE = Path("data.json")
+          NY = ZoneInfo("America/New_York")
+          CHICAGO = ZoneInfo("America/Chicago")
 
-          # ---------------------------------------
-          # Yahoo Finance取得
-          # ---------------------------------------
 
-          def fetch_json(url, retries=3, timeout=60):
+          def now_utc():
+              return dt.datetime.now(dt.timezone.utc)
+
+
+          def fetch_text(url, retries=3, timeout=60):
               last_error = None
-
               for attempt in range(retries):
                   try:
-                      req = urllib.request.Request(
+                      request = urllib.request.Request(
                           url,
-                          headers={
-                              "User-Agent": "Mozilla/5.0"
-                          }
+                          headers={"User-Agent": "market-200dma-updater/1.0"},
                       )
-
-                      with urllib.request.urlopen(
-                          req,
-                          timeout=timeout
-                      ) as r:
-                          return json.load(r)
-
-                  except Exception as e:
-                      last_error = e
-                      print(
-                          f"Request failed "
-                          f"(attempt {attempt + 1}/{retries}): {e}"
-                      )
-
+                      with urllib.request.urlopen(request, timeout=timeout) as response:
+                          return response.read().decode("utf-8")
+                  except Exception as error:
+                      last_error = error
+                      print(f"Request failed ({attempt + 1}/{retries}): {error}")
+                      if attempt + 1 < retries:
+                          time.sleep(5)
               raise last_error
 
-          # ---------------------------------------
-          # history.json読み込み
-          # ---------------------------------------
 
-          with open(
-              HISTORY_FILE,
-              "r",
-              encoding="utf-8"
-          ) as f:
-              history = json.load(f)
+          def fetch_json(url):
+              return json.loads(fetch_text(url))
 
-          old_rows = history.get("markets", [])
 
-          if not old_rows:
-              raise RuntimeError(
-                  "history.jsonに履歴データがありません"
+          def atomic_json_write(path, payload):
+              # Do not touch the checked-in file until all input validation and
+              # calculations have succeeded; os.replace is atomic on the runner.
+              with tempfile.NamedTemporaryFile(
+                  mode="w", encoding="utf-8", dir=path.parent,
+                  prefix=f".{path.name}.", suffix=".tmp", delete=False,
+              ) as handle:
+                  json.dump(payload, handle, ensure_ascii=False, indent=2)
+                  handle.write("\n")
+                  temp_name = handle.name
+              os.replace(temp_name, path)
+
+
+          def fetch_market_series(symbol, start_date):
+              start = dt.datetime.combine(
+                  start_date, dt.time.min, tzinfo=dt.timezone.utc
               )
-
-          rows_by_date = {
-              row["date"]: row
-              for row in old_rows
-          }
-
-          last_date = max(rows_by_date.keys())
-
-          print(
-              f"Existing last date: {last_date}"
-          )
-
-          # ---------------------------------------
-          # Yahoo Finance
-          # ---------------------------------------
-
-          symbols = {
-              "sp500": "^GSPC",
-              "nasdaq100": "^NDX"
-          }
-
-          market_data = {}
-
-          for name, symbol in symbols.items():
-
-              print(
-                  f"Fetching Yahoo Finance: {symbol}"
-              )
-
+              end = now_utc() + dt.timedelta(days=1)
+              query = urllib.parse.urlencode({
+                  "period1": int(start.timestamp()),
+                  "period2": int(end.timestamp()),
+                  "interval": "1d",
+                  "events": "history",
+                  "includePrePost": "false",
+              })
               url = (
                   "https://query1.finance.yahoo.com/v8/finance/chart/"
-                  + urllib.parse.quote(symbol)
-                  + "?range=30d&interval=1d"
-                  + "&events=history"
-                  + "&includePrePost=false"
+                  + urllib.parse.quote(symbol, safe="")
+                  + "?" + query
               )
-
-              result = fetch_json(url)
-
-              chart_result = result["chart"]["result"]
-
-              if not chart_result:
-                  raise RuntimeError(
-                      f"{symbol}: Yahoo Financeからデータを取得できません"
-                  )
-
-              result = chart_result[0]
-
-              timestamps = result["timestamp"]
-              closes = result["indicators"]["quote"][0]["close"]
-
+              payload = fetch_json(url)
+              results = payload.get("chart", {}).get("result") or []
+              if not results:
+                  raise RuntimeError(f"{symbol}: Yahoo Finance returned no chart data")
+              result = results[0]
+              timestamps = result.get("timestamp") or []
+              quotes = result.get("indicators", {}).get("quote") or []
+              closes = quotes[0].get("close") if quotes else []
               values = {}
-
-              for ts, close in zip(
-                  timestamps,
-                  closes
-              ):
-
+              for timestamp, close in zip(timestamps, closes):
                   if close is None:
                       continue
-
-                  date = datetime.datetime.fromtimestamp(
-                      ts,
-                      datetime.timezone.utc
+                  date = dt.datetime.fromtimestamp(
+                      timestamp, dt.timezone.utc
                   ).date().isoformat()
-
                   values[date] = float(close)
+              if not values:
+                  raise RuntimeError(f"{symbol}: Yahoo Finance returned no closes")
+              return values
 
-              market_data[name] = values
 
-              print(
-                  f"{symbol}: {len(values)} rows"
+          def fetch_dff(start_date):
+              end_date = now_utc().date() + dt.timedelta(days=1)
+              query = urllib.parse.urlencode({
+                  "id": "DFF", "cosd": start_date.isoformat(),
+                  "coed": end_date.isoformat(),
+              })
+              text = fetch_text("https://fred.stlouisfed.org/graph/fredgraph.csv?" + query)
+              values = {}
+              for row in csv.DictReader(text.splitlines()):
+                  date = row.get("observation_date")
+                  value = row.get("DFF")
+                  if date and value and value != ".":
+                      values[date] = float(value)
+              if not values:
+                  raise RuntimeError("FRED returned no DFF observations")
+              return values
+
+
+          def wait_for_h15_release():
+              # The scheduled run begins at 15:05 Chicago.  Do not request DFF
+              # before the H.15 release window opens at 15:30 Chicago.
+              current = now_utc().astimezone(CHICAGO)
+              release = current.replace(hour=15, minute=30, second=0, microsecond=0)
+              if current < release:
+                  seconds = (release - current).total_seconds()
+                  print(f"Waiting {seconds:.0f}s for the H.15 release window")
+                  time.sleep(seconds)
+
+
+          def scheduled_at_target_time():
+              current = now_utc().astimezone(NY)
+              return current.weekday() < 5 and current.hour == 16 and current.minute == 5
+
+
+          # A duplicate UTC schedule is necessary for DST. Skip the non-matching
+          # one, while allowing workflow_dispatch to run a single immediate check.
+          if os.environ.get("EVENT_NAME") == "schedule" and not scheduled_at_target_time():
+              print("Skipping UTC schedule entry outside 16:05 America/New_York")
+              raise SystemExit(0)
+
+          with HISTORY_FILE.open(encoding="utf-8") as handle:
+              history = json.load(handle)
+          with DATA_FILE.open(encoding="utf-8") as handle:
+              prior_data = json.load(handle)
+
+          original_rows = history.get("markets")
+          if not isinstance(original_rows, list) or not original_rows:
+              raise RuntimeError("history.json has no market history")
+          if any(not isinstance(row, dict) or "date" not in row for row in original_rows):
+              raise RuntimeError("history.json contains an invalid market row")
+
+          rows_by_date = {row["date"]: dict(row) for row in original_rows}
+          if len(rows_by_date) != len(original_rows):
+              raise RuntimeError("history.json contains duplicate market dates")
+          last_market_date = max(rows_by_date)
+          first_market_date = min(rows_by_date)
+          print(f"Existing last market date: {last_market_date}")
+
+          # Market updates: retry only while no new common Yahoo daily date is
+          # available. A run which starts after 17:00 ET gets exactly one check.
+          start_date = dt.date.fromisoformat(last_market_date) + dt.timedelta(days=1)
+          deadline = now_utc().astimezone(NY).replace(
+              hour=17, minute=0, second=0, microsecond=0
+          )
+          after_deadline_at_start = now_utc().astimezone(NY) >= deadline
+          market_data = None
+          common_new_dates = []
+          while True:
+              sp500 = fetch_market_series("^GSPC", start_date)
+              nasdaq100 = fetch_market_series("^NDX", start_date)
+              market_data = {"sp500": sp500, "nasdaq100": nasdaq100}
+              common_new_dates = sorted(
+                  date for date in set(sp500) & set(nasdaq100)
+                  if date > last_market_date
               )
+              if common_new_dates:
+                  break
+              current_ny = now_utc().astimezone(NY)
+              if after_deadline_at_start or current_ny >= deadline:
+                  print("No new common Yahoo market date is available; preserving history")
+                  break
+              remaining = (deadline - current_ny).total_seconds()
+              print("No new common date yet; retrying Yahoo in 5 minutes")
+              time.sleep(min(300, max(0, remaining)))
 
-          # ---------------------------------------
-          # FRED DFF
-          # curlで取得
-          # ---------------------------------------
+          # DFF is independent of whether Yahoo yielded a new market date.
+          wait_for_h15_release()
+          dff_values = fetch_dff(dt.date.fromisoformat(first_market_date))
+          dff_dates = sorted(dff_values)
 
-          last_date_obj = datetime.date.fromisoformat(
-              last_date
-          )
+          def dff_on_or_before(market_date):
+              index = bisect_right(dff_dates, market_date) - 1
+              if index < 0:
+                  return None
+              date = dff_dates[index]
+              return date, dff_values[date]
 
-          fred_start = (
-              last_date_obj
-              - datetime.timedelta(days=60)
-          ).isoformat()
-
-          fred_end = (
-              datetime.date.today()
-              + datetime.timedelta(days=1)
-          ).isoformat()
-
-          print(
-              f"Fetching FRED DFF: "
-              f"{fred_start} -> {fred_end}"
-          )
-
-          dff_url = (
-              "https://fred.stlouisfed.org/graph/fredgraph.csv"
-              "?id=DFF"
-              f"&cosd={fred_start}"
-              f"&coed={fred_end}"
-          )
-
-          with tempfile.NamedTemporaryFile(
-              mode="w+b",
-              suffix=".csv",
-              delete=False
-          ) as tmp:
-
-              dff_file = tmp.name
-
-          subprocess.run(
-              [
-                  "curl",
-                  "-4",
-                  "-L",
-                  "--fail",
-                  "--silent",
-                  "--show-error",
-                  "--max-time",
-                  "60",
-                  dff_url,
-                  "-o",
-                  dff_file
-              ],
-              check=True
-          )
-
-          with open(
-              dff_file,
-              "r",
-              encoding="utf-8"
-          ) as f:
-              text = f.read()
-
-          dff_values = {}
-
-          reader = csv.DictReader(
-              text.splitlines()
-          )
-
-          for row in reader:
-
-              date = row["observation_date"]
-              value = row["DFF"]
-
-              if value and value != ".":
-                  dff_values[date] = float(value)
-
-          print(
-              f"DFF: {len(dff_values)} rows"
-          )
-
-          # ---------------------------------------
-          # 新しい市場データを追加
-          # ---------------------------------------
-
-          all_dates = sorted(
-              set(market_data["sp500"].keys())
-              &
-              set(market_data["nasdaq100"].keys())
-          )
-
-          added = 0
-
-          for date in all_dates:
-
-              if date <= last_date:
+          # Add every missed common market date. Existing prices and dates are
+          # never changed; only DFF values are refreshed from FRED below.
+          for date in common_new_dates:
+              dff_match = dff_on_or_before(date)
+              if dff_match is None:
+                  print(f"Skipping {date}: no DFF observation on or before it")
                   continue
-
-              available_dates = [
-                  d
-                  for d in dff_values.keys()
-                  if d <= date
-              ]
-
-              if not available_dates:
-                  print(
-                      f"Skipping {date}: "
-                      "DFF not available"
-                  )
-                  continue
-
-              dff_date = max(
-                  available_dates
-              )
-
-              dff = dff_values[dff_date]
-
               rows_by_date[date] = {
                   "date": date,
-                  "sp500_close": round(
-                      market_data["sp500"][date],
-                      6
-                  ),
-                  "nasdaq100_close": round(
-                      market_data["nasdaq100"][date],
-                      6
-                  ),
-                  "dff": round(
-                      dff,
-                      6
-                  )
+                  "sp500_close": round(market_data["sp500"][date], 6),
+                  "nasdaq100_close": round(market_data["nasdaq100"][date], 6),
+                  "dff": round(dff_match[1], 6),
               }
+              print(f"Added market date: {date}")
 
-              print(
-                  f"Added: {date} "
-                  f"S&P500={market_data['sp500'][date]:.2f} "
-                  f"NDX={market_data['nasdaq100'][date]:.2f} "
-                  f"DFF={dff:.2f}"
-              )
-
-              added += 1
-
-          # ---------------------------------------
-          # 日付順に並べる
-          # ---------------------------------------
-
-          all_rows = [
-              rows_by_date[d]
-              for d in sorted(
-                  rows_by_date.keys()
-              )
-          ]
-
-          # ---------------------------------------
-          # history.json更新
-          # ---------------------------------------
-
-          history["markets"] = all_rows
-
-          history["end_date"] = all_rows[-1]["date"]
-
-          history["updated_at_utc"] = (
-              datetime.datetime.now(
-                  datetime.timezone.utc
-              ).isoformat()
-          )
-
-          with open(
-              HISTORY_FILE,
-              "w",
-              encoding="utf-8"
-          ) as f:
-
-              json.dump(
-                  history,
-                  f,
-                  ensure_ascii=False,
-                  indent=2
-              )
-
-          print(
-              f"History rows: {len(all_rows)}"
-          )
-
-          print(
-              f"New rows added: {added}"
-          )
-
-          # ---------------------------------------
-          # 200DMA計算
-          # ---------------------------------------
+          all_rows = [rows_by_date[date] for date in sorted(rows_by_date)]
+          dff_updates = 0
+          for row in all_rows:
+              dff_match = dff_on_or_before(row["date"])
+              if dff_match is None:
+                  continue
+              refreshed = round(dff_match[1], 6)
+              if row.get("dff") != refreshed:
+                  row["dff"] = refreshed
+                  dff_updates += 1
 
           latest = all_rows[-1]
+          sp_values = [row["sp500_close"] for row in all_rows]
+          ndx_values = [row["nasdaq100_close"] for row in all_rows]
+          if len(sp_values) < 200 or len(ndx_values) < 200:
+              raise RuntimeError("At least 200 market rows are required")
+          sp_ma200 = sum(sp_values[-200:]) / 200
+          ndx_ma200 = sum(ndx_values[-200:]) / 200
+          latest_dff_date = dff_dates[-1]
 
-          sp_values = [
-              row["sp500_close"]
-              for row in all_rows
-          ]
-
-          ndx_values = [
-              row["nasdaq100_close"]
-              for row in all_rows
-          ]
-
-          if (
-              len(sp_values) < 200
-              or len(ndx_values) < 200
-          ):
-              raise RuntimeError(
-                  "200営業日分のデータがありません"
-              )
-
-          sp_ma200 = (
-              sum(sp_values[-200:])
-              / 200
-          )
-
-          ndx_ma200 = (
-              sum(ndx_values[-200:])
-              / 200
-          )
-
-          sp_deviation = (
-              latest["sp500_close"]
-              / sp_ma200
-              - 1
-          ) * 100
-
-          ndx_deviation = (
-              latest["nasdaq100_close"]
-              / ndx_ma200
-              - 1
-          ) * 100
-
-          # ---------------------------------------
-          # data.json更新
-          # ---------------------------------------
-
-          data = {
-              "updated_at_utc":
-                  datetime.datetime.now(
-                      datetime.timezone.utc
-                  ).isoformat(),
-
-              "markets": {
-
-                  "sp500": {
-                      "symbol": "^GSPC",
-                      "date": latest["date"],
-                      "close": round(
-                          latest["sp500_close"],
-                          6
-                      ),
-                      "ma200": round(
-                          sp_ma200,
-                          6
-                      ),
-                      "deviation_pct": round(
-                          sp_deviation,
-                          6
-                      )
-                  },
-
-                  "nasdaq100": {
-                      "symbol": "^NDX",
-                      "date": latest["date"],
-                      "close": round(
-                          latest["nasdaq100_close"],
-                          6
-                      ),
-                      "ma200": round(
-                          ndx_ma200,
-                          6
-                      ),
-                      "deviation_pct": round(
-                          ndx_deviation,
-                          6
-                      )
-                  }
-              }
+          # Build complete replacement objects only after every remote read and
+          # validation above has succeeded.
+          history["markets"] = all_rows
+          history["end_date"] = latest["date"]
+          history["updated_at_utc"] = now_utc().isoformat()
+          data = dict(prior_data)
+          data["updated_at_utc"] = now_utc().isoformat()
+          data["markets"] = {
+              "sp500": {
+                  "symbol": "^GSPC", "date": latest["date"],
+                  "close": round(latest["sp500_close"], 6),
+                  "ma200": round(sp_ma200, 6),
+                  "deviation_pct": round((latest["sp500_close"] / sp_ma200 - 1) * 100, 6),
+              },
+              "nasdaq100": {
+                  "symbol": "^NDX", "date": latest["date"],
+                  "close": round(latest["nasdaq100_close"], 6),
+                  "ma200": round(ndx_ma200, 6),
+                  "deviation_pct": round((latest["nasdaq100_close"] / ndx_ma200 - 1) * 100, 6),
+              },
+          }
+          data["dff"] = {
+              "date": latest_dff_date,
+              "value": round(dff_values[latest_dff_date], 6),
           }
 
-          with open(
-              DATA_FILE,
-              "w",
-              encoding="utf-8"
-          ) as f:
-
-              json.dump(
-                  data,
-                  f,
-                  ensure_ascii=False,
-                  indent=2
-              )
-
-          print(
-              "data.json updated"
-          )
-
+          atomic_json_write(HISTORY_FILE, history)
+          atomic_json_write(DATA_FILE, data)
+          print(f"Market rows added: {len(common_new_dates)}; DFF rows refreshed: {dff_updates}")
           PY
 
       - name: Commit updated data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add history.json data.json
-
           if git diff --cached --quiet; then
             echo "No changes"
           else
             git commit -m "Update market history"
             git push
           fi
+
