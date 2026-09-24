@@ -1,8 +1,8 @@
 {
   "version": 1,
   "start_date": "2000-01-03",
-  "end_date": "2026-09-23",
-  "updated_at_utc": "2026-09-23T22:45:12.809106+00:00",
+  "end_date": "2026-09-24",
+  "updated_at_utc": "2026-09-24T23:03:40.943488+00:00",
   "sources": {
     "sp500": "Yahoo Finance ^GSPC",
     "nasdaq100": "Yahoo Finance ^NDX",
@@ -40327,6 +40327,12 @@
       "date": "2026-09-23",
       "sp500_close": 7706.029785,
       "nasdaq100_close": 30470.292969,
+      "dff": 3.88
+    },
+    {
+      "date": "2026-09-24",
+      "sp500_close": 7704.129883,
+      "nasdaq100_close": 30478.855469,
       "dff": 3.88
     }
   ]
