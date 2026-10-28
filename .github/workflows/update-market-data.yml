@@ -4,6 +4,9 @@ on:
   schedule:
     - cron: "5 16 * * 1-5"
       timezone: "America/New_York"
+    # Retry once after the close window if the earlier run failed or was delayed.
+    - cron: "15 17 * * 1-5"
+      timezone: "America/New_York"
   workflow_dispatch:
 
 permissions:
@@ -176,8 +179,16 @@ jobs:
           market_data = None
           common_new_dates = []
           while True:
-              sp500 = fetch_market_series("^GSPC", start_date)
-              nasdaq100 = fetch_market_series("^NDX", start_date)
+              try:
+                  sp500 = fetch_market_series("^GSPC", start_date)
+                  nasdaq100 = fetch_market_series("^NDX", start_date)
+              except Exception as error:
+                  print(f"Yahoo fetch failed: {error}; will still refresh DFF")
+                  current_ny = now_utc().astimezone(NY)
+                  if after_deadline_at_start or current_ny >= deadline:
+                      break
+                  time.sleep(min(300, max(0, (deadline - current_ny).total_seconds())))
+                  continue
               market_data = {"sp500": sp500, "nasdaq100": nasdaq100}
               common_new_dates = sorted(
                   date for date in set(sp500) & set(nasdaq100)
@@ -195,7 +206,13 @@ jobs:
 
           # DFF is independent of whether Yahoo yielded a new market date.
           wait_for_h15_release()
-          dff_values = fetch_dff(dt.date.fromisoformat(first_market_date))
+          try:
+              dff_values = fetch_dff(dt.date.fromisoformat(first_market_date))
+          except Exception as error:
+              print(f"FRED fetch failed: {error}; retaining existing DFF values")
+              dff_values = {row["date"]: float(row["dff"]) for row in original_rows if row.get("dff") is not None}
+              if not dff_values:
+                  raise RuntimeError("Neither FRED nor historical DFF is available")
           dff_dates = sorted(dff_values)
 
           def dff_on_or_before(market_date):
