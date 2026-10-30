@@ -2,7 +2,7 @@
   "version": 1,
   "start_date": "2000-01-03",
   "end_date": "2026-10-29",
-  "updated_at_utc": "2026-10-29T23:52:36.087728+00:00",
+  "updated_at_utc": "2026-10-30T01:05:53.824274+00:00",
   "sources": {
     "sp500": "Yahoo Finance ^GSPC",
     "nasdaq100": "Yahoo Finance ^NDX",
