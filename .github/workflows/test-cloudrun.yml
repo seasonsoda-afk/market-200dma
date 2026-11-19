@@ -1,0 +1,23 @@
+name: Validate Cloud Run pilot
+on:
+  pull_request:
+    paths:
+      - 'cloudrun/**'
+      - '.github/workflows/test-cloudrun.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Syntax-check Python and Bash
+        run: |
+          python -m py_compile cloudrun/update.py
+          bash -n cloudrun/setup.sh
+      - name: Build pilot container (no push, no credentials)
+        run: docker build -f cloudrun/Dockerfile -t market-200dma-pilot:test .

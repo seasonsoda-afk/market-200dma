@@ -1,0 +1,84 @@
+# Cloud Run migration – 200DMA app
+
+## First-time Google Cloud setup (user-owned account)
+
+1. Open https://console.cloud.google.com/ and sign in with your own Google account.
+2. Create a new project, choose a unique Project ID and link a billing account.
+   Billing setup and payment information require your own authorization.
+3. Open Cloud Shell from the Google Cloud console (terminal icon).
+4. Run the following commands, replacing `YOUR_PROJECT_ID` with the actual ID:
+
+```bash
+git clone https://github.com/seasonsoda-afk/market-200dma.git
+cd market-200dma
+git fetch origin cloud-run-market-updater
+git checkout cloud-run-market-updater
+bash cloudrun/setup.sh YOUR_PROJECT_ID
+```
+
+5. When prompted, supply a repository-scoped fine-grained GitHub token. The
+   setup script places it in Google Secret Manager, not the repository.
+6. Initially the Cloud Run job is dry-run-only; inspect the execution logs.
+   The current GitHub Actions job stays enabled until the new job has passed
+   several-day comparison.
+
+**Do not paste your GitHub token, Google passwords, or billing details into chat.**
+
+
+This directory contains a *pilot* replacement for the GitHub Actions schedule.
+Do not disable the existing `.github/workflows/update-market-data.yml` before
+the external job is deployed and several market sessions have been compared.
+
+## Behavior
+- Uses the existing Yahoo Finance ^GSPC / ^NDX daily close inputs.
+- Adds **only new trading dates** and preserves existing observed closing levels.
+- Recomputes 200-trading-day averages and writes existing `history.json` and
+  `data.json` formats consumed by GitHub Pages.
+- Publishes prices before trying FRED DFF; FRED failures do not block price output.
+- **DRY_RUN=true by default**, so no GitHub writes occur until explicitly enabled.
+- Runs idempotently: if no newer common index date is available, it skips price writes.
+- Does not independently prove Yahoo's early after-close daily candle is final.
+  Compare multiple days with official closing levels before disabling the old updater.
+
+## Build and deploy
+From repository root, with a Google Cloud project and billing enabled:
+
+```sh
+PROJECT_ID="your-gcp-project-id"
+REGION="asia-northeast1"
+gcloud config set project "$PROJECT_ID"
+gcloud services enable run.googleapis.com cloudscheduler.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
+
+gcloud artifacts repositories create seasonsoda-jobs --repository-format=docker --location="$REGION"
+gcloud builds submit --config cloudrun/cloudbuild.yaml --substitutions "_REGION=$REGION" .
+```
+
+Create a **fine-grained GitHub token** restricted to
+`seasonsoda-afk/market-200dma` with `Contents: Read and write`. Store it in
+Google Secret Manager; never commit it to this repository.
+
+Create a Cloud Run Job using the above image. Set:
+- `GITHUB_REPO=seasonsoda-afk/market-200dma`
+- `DRY_RUN=true` initially
+- `GITHUB_TOKEN` from Secret Manager
+- max retries: 0; single task
+- Service account with only Secret Manager Secret Accessor on that secret.
+
+Schedule via Cloud Scheduler (timezone `America/New_York`) at 16:15, 16:30,
+16:45, 17:00, 17:15 and 17:30 on weekdays. This requires two cron schedules:
+`15,30,45 16 * * 1-5` and `0,15,30 17 * * 1-5`.
+Point both schedules at the same Cloud Run job with an OAuth-authenticated service
+account that has `roles/run.invoker`.
+
+## Rollout checklist
+1. Deploy with DRY_RUN=true, check Cloud Logging for successful Yahoo dates.
+2. Verify index levels / SMA against the existing app for several sessions.
+3. Enable writes only after handling conflicts with the existing GitHub updater;
+   do not leave two production writers active indefinitely.
+4. Compare GitHub Pages visibility and data-file dates.
+5. Disable the GitHub Actions `schedule` trigger after confirmed cutover, while
+   retaining `workflow_dispatch` for rollback.
+6. Confirm Google Cloud costs and scheduler alerts.
+
+Caveat: during pilot, jobs may be triggered multiple times. Cloud Run and Cloud
+Scheduler are not hard real-time services. Yahoo is an unofficial data feed.
