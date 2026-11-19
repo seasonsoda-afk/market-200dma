@@ -17,7 +17,9 @@ jobs:
           python-version: '3.12'
       - name: Syntax-check Python and Bash
         run: |
-          python -m py_compile cloudrun/update.py
+          python -m py_compile cloudrun/update.py cloudrun/test_update.py
           bash -n cloudrun/setup.sh
+      - name: Unit tests (offline)
+        run: python -m unittest cloudrun.test_update -v
       - name: Build pilot container (no push, no credentials)
         run: docker build -f cloudrun/Dockerfile -t market-200dma-pilot:test .
