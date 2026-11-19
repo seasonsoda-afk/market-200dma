@@ -89,22 +89,75 @@ def fetch_yahoo(symbol: str, since: dt.date):
     return values
 
 
-def fetch_dff():
-    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFF"
-    headers = {"User-Agent": USER_AGENT}
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=12) as response:
-        text = response.read().decode("utf-8-sig")
+def _decode_rates_csv(text: str) -> dict[str, float]:
     import csv
     from io import StringIO
     result = {}
     for row in csv.DictReader(StringIO(text)):
         day = row.get("observation_date") or row.get("DATE")
-        val = row.get("DFF")
-        if day and val and val != ".":
-            result[day] = float(val)
+        value = row.get("DFF")
+        if day and value and value != ".":
+            result[day] = float(value)
     if not result:
         raise RuntimeError("No usable FRED DFF values")
     return result
+
+
+def fetch_dff(since: dt.date):
+    """Fetch only recent FRED observations; a full 1954+ CSV is unnecessary."""
+    start = since - dt.timedelta(days=7)
+    qs = urllib.parse.urlencode({"id": "DFF", "cosd": start.isoformat()})
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + qs
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "market-200dma-updater/1.0"}
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        text = response.read().decode("utf-8-sig")
+    return _decode_rates_csv(text)
+
+
+def fetch_new_york_fed_effr():
+    """Official EFFR series used as a fallback for the same effective rate.
+
+    The NY Fed publishes the prior business day's EFFR at ~09:00 ET.
+    The response is validated and only the latest short window is used.
+    """
+    url = "https://markets.newyorkfed.org/api/rates/unsecured/effr/last/20.json"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "market-200dma-updater/1.0",
+                      "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=12) as response:
+        payload = json.load(response)
+    records = payload.get("refRates", {}).get("effr")
+    if not isinstance(records, list) or not records:
+        raise RuntimeError("NY Fed response has no refRates.effr")
+    rates = {}
+    for item in records:
+        day = item.get("effectiveDate")
+        value = item.get("percentRate")
+        if day is None or value is None:
+            continue
+        dt.date.fromisoformat(day)
+        rate = float(value)
+        if not 0 <= rate <= 30:
+            raise RuntimeError("NY Fed EFFR outside sanity range")
+        rates[day] = rate
+    if not rates:
+        raise RuntimeError("NY Fed EFFR response contains no valid rates")
+    return rates
+
+
+def fetch_recent_rates(since: dt.date):
+    try:
+        rates = fetch_dff(since)
+        LOG.info("DFF source=FRED; last available date=%s", max(rates))
+        return rates
+    except Exception as fred_error:
+        LOG.warning("FRED DFF unavailable (%s); trying official NY Fed EFFR", fred_error)
+        rates = fetch_new_york_fed_effr()
+        LOG.info("DFF source=NY Fed EFFR; last available date=%s", max(rates))
+        return rates
 
 
 def refresh_prices():
@@ -168,34 +221,52 @@ def refresh_prices():
 
 
 def refresh_fred():
-    # This is intentionally after the price publish. A slow FRED endpoint
-    # must never block price availability.
+    # Price publication has already finished. Rate retrieval must not block
+    # prices, and any failure must retain the last known as-of date.
     try:
-        rates = fetch_dff()
         history, history_sha = get_file("history.json")
         data, data_sha = get_file("data.json")
-        sorted_dates = sorted(rates)
-        latest_rate = sorted_dates[-1]
-        if data.get("dff", {}).get("date") == latest_rate:
-            LOG.info("DFF already up to date through %s", latest_rate)
+        current_dff = data.get("dff", {})
+        current_date_str = current_dff.get("date")
+        if not current_date_str:
+            raise RuntimeError("Stored DFF observation date is missing")
+        current_date = dt.date.fromisoformat(current_date_str)
+        rates = fetch_recent_rates(current_date)
+        latest_rate_date = max(rates)
+        if latest_rate_date <= current_date_str:
+            LOG.info("No newer EFFR observation (stored=%s; available=%s)",
+                     current_date_str, latest_rate_date)
             return
-        changed = False
+
+        # Only backfill dates newer than the stored published DFF date.
+        # Never rewrite 25+ years of historical rate observations.
+        new_rate_dates = sorted(day for day in rates if day > current_date_str)
+        changes = 0
         for row in history["markets"]:
-            pos = bisect_right(sorted_dates, row["date"]) - 1
+            if row["date"] <= current_date_str:
+                continue
+            pos = bisect_right(new_rate_dates, row["date"]) - 1
             if pos >= 0:
-                new_rate = round(rates[sorted_dates[pos]], 6)
-                if row.get("dff") != new_rate:
-                    row["dff"] = new_rate
-                    changed = True
-        data["dff"] = {"date": latest_rate, "value": round(rates[latest_rate], 6)}
-        history["updated_at_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        data["updated_at_utc"] = history["updated_at_utc"]
-        if changed:
+                latest_for_day = new_rate_dates[pos]
+                value = round(rates[latest_for_day], 6)
+                if row.get("dff") != value:
+                    row["dff"] = value
+                    changes += 1
+
+        data["dff"] = {
+            "date": latest_rate_date,
+            "value": round(rates[latest_rate_date], 6),
+        }
+        stamp = dt.datetime.now(dt.timezone.utc).isoformat()
+        data["updated_at_utc"] = stamp
+        if changes:
+            history["updated_at_utc"] = stamp
             update_file("history.json", history, history_sha)
         update_file("data.json", data, data_sha)
-        LOG.info("Prepared/published DFF through %s", latest_rate)
+        LOG.info("DFF updated through %s; corrected %s market rows",
+                 latest_rate_date, changes)
     except Exception:
-        LOG.exception("DFF refresh failed; previously published prices remain intact")
+        LOG.exception("DFF refresh failed; last published DFF date remains unchanged")
 
 
 def main():
