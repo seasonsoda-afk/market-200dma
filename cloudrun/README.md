@@ -25,12 +25,8 @@ gcloud config set project "$PROJECT_ID"
 gcloud services enable run.googleapis.com cloudscheduler.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com
 
 gcloud artifacts repositories create seasonsoda-jobs --repository-format=docker --location="$REGION"
-gcloud builds submit --tag "$REGION-docker.pkg.dev/$PROJECT_ID/seasonsoda-jobs/market-200dma:pilot" -f cloudrun/Dockerfile .
+gcloud builds submit --config cloudrun/cloudbuild.yaml --substitutions "_REGION=$REGION" .
 ```
-
-If your gcloud version doesn't support `-f` in `gcloud builds submit`, use
-`gcloud builds submit --config=cloudrun/cloudbuild.yaml .` after adding a
-suitable build configuration, or build via Cloud Build configuration in Console.
 
 Create a **fine-grained GitHub token** restricted to
 `seasonsoda-afk/market-200dma` with `Contents: Read and write`. Store it in
