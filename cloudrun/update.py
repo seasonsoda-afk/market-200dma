@@ -28,9 +28,13 @@ USER_AGENT = "SEASONSODA-cloud-run-200dma/1.0"
 
 
 def request(url: str, *, method: str = "GET", payload=None, timeout=15):
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
-    if "api.github.com/" in url and TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
+    # GitHub's API media type must not be sent to Yahoo Finance. The
+    # existing production workflow sends only a simple User-Agent to Yahoo.
+    headers = {"User-Agent": "market-200dma-updater/1.0"}
+    if "api.github.com/" in url:
+        headers["Accept"] = "application/vnd.github+json"
+        if TOKEN:
+            headers["Authorization"] = f"Bearer {TOKEN}"
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -68,7 +72,7 @@ def fetch_yahoo(symbol: str, since: dt.date):
     symbol_url = urllib.parse.quote(symbol, safe="")
     qs = urllib.parse.urlencode({
         "period1": start, "period2": end,
-        "interval": "1d", "includePrePost": "false",
+        "interval": "1d", "events": "history", "includePrePost": "false",
     })
     data = request(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol_url}?{qs}")
     result = (data.get("chart", {}).get("result") or [None])[0]
