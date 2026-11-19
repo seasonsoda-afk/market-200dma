@@ -1,5 +1,30 @@
 # Cloud Run migration – 200DMA app
 
+## First-time Google Cloud setup (user-owned account)
+
+1. Open https://console.cloud.google.com/ and sign in with your own Google account.
+2. Create a new project, choose a unique Project ID and link a billing account.
+   Billing setup and payment information require your own authorization.
+3. Open Cloud Shell from the Google Cloud console (terminal icon).
+4. Run the following commands, replacing `YOUR_PROJECT_ID` with the actual ID:
+
+```bash
+git clone https://github.com/seasonsoda-afk/market-200dma.git
+cd market-200dma
+git fetch origin cloud-run-market-updater
+git checkout cloud-run-market-updater
+bash cloudrun/setup.sh YOUR_PROJECT_ID
+```
+
+5. When prompted, supply a repository-scoped fine-grained GitHub token. The
+   setup script places it in Google Secret Manager, not the repository.
+6. Initially the Cloud Run job is dry-run-only; inspect the execution logs.
+   The current GitHub Actions job stays enabled until the new job has passed
+   several-day comparison.
+
+**Do not paste your GitHub token, Google passwords, or billing details into chat.**
+
+
 This directory contains a *pilot* replacement for the GitHub Actions schedule.
 Do not disable the existing `.github/workflows/update-market-data.yml` before
 the external job is deployed and several market sessions have been compared.
