@@ -1,0 +1,13 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - cloudrun/Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/seasonsoda-jobs/market-200dma:pilot
+      - .
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/seasonsoda-jobs/market-200dma:pilot
+substitutions:
+  _REGION: asia-northeast1
