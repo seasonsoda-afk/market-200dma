@@ -1,5 +1,10 @@
 name: Validate Cloud Run pilot
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'cloudrun/**'
+      - '.github/workflows/test-cloudrun.yml'
   pull_request:
     paths:
       - 'cloudrun/**'
