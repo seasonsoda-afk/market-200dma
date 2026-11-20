@@ -21,6 +21,14 @@ class RateTests(unittest.TestCase):
                 {"2026-11-19": 3.88},
             )
 
+    def test_ny_fed_response_has_ref_rates_array(self):
+        import io
+        body = b'{"refRates":[{"effectiveDate":"2026-11-19","percentRate":3.88}]}'
+        with patch.object(update.urllib.request, "urlopen",
+                          return_value=io.BytesIO(body)):
+            rates = update.fetch_new_york_fed_effr()
+        self.assertEqual(rates, {"2026-11-19": 3.88})
+
     def test_no_backdating_of_historical_rates(self):
         history = {
             "markets": [
