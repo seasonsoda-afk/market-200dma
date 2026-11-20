@@ -129,9 +129,9 @@ def fetch_new_york_fed_effr():
     )
     with urllib.request.urlopen(req, timeout=12) as response:
         payload = json.load(response)
-    records = payload.get("refRates", {}).get("effr")
+    records = payload.get("refRates")
     if not isinstance(records, list) or not records:
-        raise RuntimeError("NY Fed response has no refRates.effr")
+        raise RuntimeError("NY Fed response has no refRates list")
     rates = {}
     for item in records:
         day = item.get("effectiveDate")
